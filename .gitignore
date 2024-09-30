@@ -1,0 +1,29 @@
+# Ignore node_modules folders in all subdirectories
+**/node_modules
+.env
+
+# Ignore .pnp files in all subdirectories
+**/.pnp
+**/.pnp.js
+
+# Ignore coverage folders in all subdirectories
+**/coverage
+
+# Ignore build folders in all subdirectories
+**/build
+
+# Ignore .DS_Store files in all subdirectories
+**/.DS_Store
+
+# Ignore .env.local, .env.development.local, .env.test.local, .env.production.local files in all subdirectories
+**/.env.local
+**/.env.development.local
+**/.env.test.local
+**/.env.production.local
+
+# Ignore npm debug logs in all subdirectories
+**/npm-debug.log*
+
+# Ignore yarn debug logs and error logs in all subdirectories
+**/yarn-debug.log*
+**/yarn-error.log*
