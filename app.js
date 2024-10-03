@@ -7,6 +7,8 @@ import { exec, spawn } from "child_process"; // Include spawn here
 import { execFile } from "child_process";
 import bodyParser from "body-parser";
 import fs from "fs";
+import unzipper from "unzipper";
+
 import path from "path"; // Import path module
 dotenv.config();
 
@@ -49,6 +51,62 @@ app.post("/folders/*", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to create folder." });
+  }
+});
+
+// Upload ZIP endpoint
+app.post("/upload-zip/:path*", upload.single("zipFile"), async (req, res) => {
+  const zipPath = req.params.path; // Capture the path after /upload-zip/
+  const zipFile = req.file; // The uploaded file
+
+  // Check if file is provided
+  if (!zipFile) {
+    return res.status(400).json({ error: "No ZIP file uploaded." });
+  }
+
+  try {
+    const filesUploaded = [];
+
+    // Process the ZIP file stream
+    await new Promise((resolve, reject) => {
+      // Use unzipper to extract the ZIP contents
+      const stream = unzipper.Parse();
+
+      // Create a stream from the uploaded ZIP file buffer
+      stream.on("entry", async (entry) => {
+        const fileName = entry.path; // Get the name of the file in the ZIP
+        const params = {
+          Bucket: process.env.DO_SPACE_NAME,
+          Key: `${zipPath}/${fileName}`, // Set the full path in the bucket
+          Body: entry, // Use the entry stream as the body
+          ACL: "public-read", // Make the file publicly accessible
+        };
+
+        try {
+          // Upload the file to DigitalOcean Spaces
+          await s3.upload(params).promise();
+          filesUploaded.push(fileName);
+          entry.autodrain(); // Skip the file entry
+        } catch (error) {
+          console.error(error);
+          reject(error); // Reject the promise if upload fails
+        }
+      });
+
+      stream.on("finish", resolve); // Resolve the promise when done
+      stream.on("error", reject); // Reject on stream error
+
+      // Start the extraction process
+      stream.end(zipFile.buffer); // End the stream with the buffer
+    });
+
+    res.json({
+      message: `Successfully uploaded ${filesUploaded.length} files from ZIP.`,
+      files: filesUploaded,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to upload files from ZIP." });
   }
 });
 
@@ -96,7 +154,15 @@ async function getFolderContents(folderPath) {
   return { files, folders };
 }
 
-// List files and folders in a specified path
+// Helper function to format file size
+const formatFileSize = (bytes) => {
+  if (bytes === 0) return "0 Bytes";
+  const k = 1024;
+  const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+};
+
 app.get("/folders/*", async (req, res) => {
   const folderPath = req.params[0]; // Capture full path after /folders/
 
@@ -108,35 +174,28 @@ app.get("/folders/*", async (req, res) => {
 
   try {
     const data = await s3.listObjectsV2(params).promise();
-    const files = data.Contents.map((file) => file.Key);
-    const commonPrefixes = data.CommonPrefixes.map((prefix) => prefix.Prefix);
 
-    // Check if the folderPath has any new folders created
-    const newFolderKey = `${folderPath}/`;
-    if (files.length === 0 && commonPrefixes.length === 0) {
-      // Check if there are any folders starting with folderPath
-      const paramsCheck = {
-        Bucket: process.env.DO_SPACE_NAME,
-        Prefix: newFolderKey, // Check for any subfolders under the current path
-        Delimiter: "/",
-      };
-      const checkData = await s3.listObjectsV2(paramsCheck).promise();
-
-      // Dynamically add any found folders
-      checkData.CommonPrefixes.forEach((prefix) => {
-        commonPrefixes.push(prefix.Prefix);
-      });
-    }
-
-    res.json({
-      files: files.map((file) => ({
-        file,
+    // Get total size of files in the folder
+    let totalSize = 0;
+    const files = data.Contents.map((file) => {
+      totalSize += file.Size;
+      return {
+        file: file.Key,
+        size: formatFileSize(file.Size), // Size in human-readable format
         signedUrl: s3.getSignedUrl("getObject", {
           Bucket: process.env.DO_SPACE_NAME,
-          Key: file,
+          Key: file.Key,
           Expires: 60 * 5, // URL expires in 5 minutes
         }),
-      })),
+      };
+    });
+
+    const commonPrefixes = data.CommonPrefixes.map((prefix) => prefix.Prefix);
+
+    // Return the total size along with file and folder information
+    res.json({
+      totalSize: formatFileSize(totalSize), // Total size of files in human-readable format
+      files,
       folders: commonPrefixes,
     });
   } catch (error) {
@@ -145,83 +204,62 @@ app.get("/folders/*", async (req, res) => {
   }
 });
 
-// Upload a file to a specified path
-app.post("/files/*", upload.single("file"), async (req, res) => {
+// Upload multiple files to a specified path
+app.post("/files/*", upload.array("file", 10), async (req, res) => {
   const filePath = req.params[0]; // Capture full path after /files/
-  const file = req.file;
+  const files = req.files;
 
-  // Check if file is provided
-  if (!file) {
-    return res.status(400).json({ error: "No file uploaded." });
+  // Check if files are provided
+  if (!files || files.length === 0) {
+    return res.status(400).json({ error: "No files uploaded." });
   }
 
-  // Function to determine the content type based on the file extension
-  const determineContentType = (filename) => {
-    const extension = filename.split(".").pop().toLowerCase();
-    switch (extension) {
-      case "html":
-        return "text/html";
-      case "css":
-        return "text/css";
-      case "js":
-        return "application/javascript";
-      case "png":
-        return "image/png";
-      case "jpg":
-      case "jpeg":
-        return "image/jpeg";
-      case "gif":
-        return "image/gif";
-      case "svg":
-        return "image/svg+xml";
-      case "json":
-        return "application/json";
-      case "pdf":
-        return "application/pdf";
-      default:
-        return "application/octet-stream"; // Default for unknown file types
+  const uploadedFiles = [];
+
+  for (const file of files) {
+    const params = {
+      Bucket: process.env.DO_SPACE_NAME,
+      Key: `${filePath}/${file.originalname}`, // Full path in the bucket
+      Body: file.buffer,
+      ACL: "public-read", // Ensure the file is publicly accessible
+      ContentType: file.mimetype, // Use the correct MIME type
+    };
+
+    try {
+      // Upload the file to DigitalOcean Spaces
+      await s3.upload(params).promise();
+      uploadedFiles.push({
+        fileName: file.originalname,
+        message: `File "${file.originalname}" uploaded to "${filePath}".`,
+      });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ error: "Failed to upload some files." });
     }
-  };
-
-  // Determine the content type
-  const contentType = determineContentType(file.originalname);
-
-  const params = {
-    Bucket: process.env.DO_SPACE_NAME,
-    Key: `${filePath}/${file.originalname}`, // Full path in the bucket
-    Body: file.buffer,
-    ACL: "public-read", // Ensure the file is publicly accessible
-    ContentType: contentType, // Set the correct content type
-  };
-
-  try {
-    // Upload the file to DigitalOcean Spaces
-    await s3.upload(params).promise();
-    res.json({
-      message: `File "${file.originalname}" uploaded to "${filePath}".`,
-      contentType,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to upload file." });
   }
+
+  res.json({ uploadedFiles });
 });
 
-// Serve a file
 app.get("/files/*", async (req, res) => {
   const filePath = req.params[0]; // Capture full path after /files/
+
   const params = {
     Bucket: process.env.DO_SPACE_NAME,
     Key: filePath,
   };
 
   try {
+    const headData = await s3.headObject(params).promise(); // Fetch file metadata, including size
+    const size = headData.ContentLength; // Size in bytes
+
     const url = s3.getSignedUrl("getObject", {
       Bucket: process.env.DO_SPACE_NAME,
       Key: filePath,
       Expires: 60 * 5, // URL expires in 5 minutes
     });
-    res.json({ url });
+
+    res.json({ url, size: formatFileSize(size) }); // Return file URL and formatted size
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to retrieve file." });
@@ -334,7 +372,6 @@ app.post("/convert", (req, res) => {
     }
   });
 });
-
 
 app.use((err, req, res, next) => {
   console.error(err.stack);
